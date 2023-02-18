@@ -1,8 +1,21 @@
-import { readFileSync } from "fs";
-import { dirname, join } from "path";
+import {
+  existsSync,
+  mkdirSync,
+  promises,
+  readdirSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "fs";
+import { dirname, join, relative } from "path";
 import { fileURLToPath } from "url";
 import { SourceMapPayload } from "module";
-import { Output, ParserConfig, ReactConfig, transform } from "@swc/core";
+import {
+  ParserConfig,
+  ReactConfig,
+  transform,
+  version as swcVersion,
+} from "@swc/core";
 import { PluginOption } from "vite";
 import { createRequire } from "module";
 
@@ -40,6 +53,17 @@ type Options = {
   plugins?: [string, Record<string, any>][];
 };
 
+let root: string;
+let cachePath: string;
+const PLUGIN_CACHE_VERSION = 1;
+type CacheEntry = {
+  input: string;
+  code: string;
+  map: SourceMapPayload;
+};
+type MetadataCache = { version: string };
+const cache = new Map<string, CacheEntry>();
+
 const react = (_options?: Options): PluginOption[] => {
   const options = {
     jsxImportSource: _options?.jsxImportSource ?? "react",
@@ -74,23 +98,65 @@ const react = (_options?: Options): PluginOption[] => {
           ),
         },
       ],
+      configResolved: async (config) => {
+        if (cache.size > 0) return;
+        root = config.root;
+        cachePath = join(config.cacheDir, "swc-cache");
+        const metadataPath = join(cachePath, "_metadata.json");
+        const version = `${PLUGIN_CACHE_VERSION}-${swcVersion}`;
+        if (existsSync(metadataPath)) {
+          const content = readFileSync(metadataPath, "utf-8");
+          const previousCache = JSON.parse(content) as MetadataCache;
+          if (previousCache.version === version) {
+            const start = performance.now();
+            await Promise.all(
+              readdirSync(cachePath)
+                .filter((f) => f.endsWith(".json") && f !== "_metadata.json")
+                .map(async (f) => {
+                  const json = await promises.readFile(
+                    `${cachePath}/${f}`,
+                    "utf-8",
+                  );
+                  cache.set(f, JSON.parse(json));
+                }),
+            );
+            console.log(
+              `cache restored: ${(performance.now() - start).toFixed(2)}ms`,
+            );
+          } else {
+            rmSync(cachePath, { recursive: true, force: true });
+            mkdirSync(cachePath);
+          }
+        } else {
+          mkdirSync(cachePath, { recursive: true });
+        }
+        const metadataCache: MetadataCache = { version };
+        writeFileSync(metadataPath, JSON.stringify(metadataCache));
+      },
       async transform(code, _id, transformOptions) {
         const id = _id.split("?")[0];
+        const parser = getParser(id, options);
+        if (!parser) return;
 
-        const result = await transformWithOptions(id, code, options, {
-          refresh: !transformOptions?.ssr,
+        const ssr = transformOptions?.ssr;
+        const fileCachePath = `${relative(root, id).replace(/\//g, "|")}${
+          ssr ? "-srr" : ""
+        }.json`;
+        const cachedEntry = cache.get(fileCachePath);
+        if (cachedEntry?.input === code) {
+          return { code: cachedEntry.code, map: cachedEntry.map };
+        }
+
+        const result = await transformWithOptions(id, code, parser, options, {
+          refresh: !ssr,
           development: true,
           useBuiltins: true,
           runtime: "automatic",
           importSource: options.jsxImportSource,
         });
-        if (!result) return;
 
-        if (transformOptions?.ssr || !refreshContentRE.test(result.code)) {
-          return result;
-        }
-
-        result.code = `import * as RefreshRuntime from "${runtimePublicPath}";
+        if (!ssr && refreshContentRE.test(result.code)) {
+          result.code = `import * as RefreshRuntime from "${runtimePublicPath}";
 
 if (!window.$RefreshReg$) throw new Error("React refresh preamble was not loaded. Something is wrong.");
 const prevRefreshReg = window.$RefreshReg$;
@@ -111,9 +177,21 @@ import(/* @vite-ignore */ import.meta.url).then((currentExports) => {
   });
 });
 `;
+        }
 
         const sourceMap: SourceMapPayload = JSON.parse(result.map!);
         sourceMap.mappings = ";;;;;;;;" + sourceMap.mappings;
+
+        const entry: CacheEntry = {
+          input: code,
+          code: result.code,
+          map: sourceMap,
+        };
+        promises.writeFile(
+          `${cachePath}/${fileCachePath}`,
+          JSON.stringify(entry),
+        );
+
         return { code: result.code, map: sourceMap };
       },
     },
@@ -122,12 +200,16 @@ import(/* @vite-ignore */ import.meta.url).then((currentExports) => {
           name: "vite:react-swc",
           apply: "build",
           enforce: "pre", // Run before esbuild
-          transform: (code, _id) =>
-            transformWithOptions(_id.split("?")[0], code, options, {
+          transform: (code, _id) => {
+            const id = _id.split("?")[0];
+            const parser = getParser(id, options);
+            if (!parser) return;
+            return transformWithOptions(id, code, parser, options, {
               useBuiltins: true,
               runtime: "automatic",
               importSource: options.jsxImportSource,
-            }),
+            });
+          },
         }
       : {
           name: "vite:react-swc",
@@ -145,16 +227,11 @@ import(/* @vite-ignore */ import.meta.url).then((currentExports) => {
   ];
 };
 
-const transformWithOptions = async (
-  id: string,
-  code: string,
-  options: Options,
-  reactConfig: ReactConfig,
-) => {
+const getParser = (id: string, options: Options): ParserConfig | undefined => {
   if (id.includes("node_modules")) return;
 
   const decorators = options?.tsDecorators ?? false;
-  const parser: ParserConfig | undefined = id.endsWith(".tsx")
+  return id.endsWith(".tsx")
     ? { syntax: "typescript", tsx: true, decorators }
     : id.endsWith(".ts")
     ? { syntax: "typescript", tsx: false, decorators }
@@ -164,26 +241,30 @@ const transformWithOptions = async (
     ? // JSX is required to trigger fast refresh transformations, even if MDX already transforms it
       { syntax: "ecmascript", jsx: true }
     : undefined;
-  if (!parser) return;
+};
 
-  let result: Output;
-  try {
-    result = await transform(code, {
-      filename: id,
-      swcrc: false,
-      configFile: false,
-      sourceMaps: true,
-      jsc: {
-        target: "es2020",
-        parser,
-        experimental: { plugins: options.plugins },
-        transform: {
-          useDefineForClassFields: true,
-          react: reactConfig,
-        },
+const transformWithOptions = async (
+  id: string,
+  code: string,
+  parser: ParserConfig,
+  options: Options,
+  reactConfig: ReactConfig,
+) =>
+  transform(code, {
+    filename: id,
+    swcrc: false,
+    configFile: false,
+    sourceMaps: true,
+    jsc: {
+      target: "es2020",
+      parser,
+      experimental: { plugins: options.plugins },
+      transform: {
+        useDefineForClassFields: true,
+        react: reactConfig,
       },
-    });
-  } catch (e: any) {
+    },
+  }).catch((e: any) => {
     const message: string = e.message;
     const fileStartIndex = message.indexOf("╭─[");
     if (fileStartIndex !== -1) {
@@ -194,9 +275,6 @@ const transformWithOptions = async (
       }
     }
     throw e;
-  }
-
-  return result;
-};
+  });
 
 export default react;
